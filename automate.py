@@ -1,267 +1,282 @@
-# HyperOS Universal Sniper (API + ADB Hybrid)
-# Copyright (C) 2026 Arseniy1002
-# Licensed under the GNU General Public License v3.0
-
 import sys
 import argparse
 import time
 import os
 import tempfile
-import threading
-import hashlib
-import random
-import json
-import webbrowser
 from xml.etree import ElementTree as ET
 from datetime import datetime, timedelta, timezone
 
 import ntplib
-import urllib3
 import adbutils
-from adbutils.errors import AdbConnectionError
-from colorama import init, Fore, Style
+from adbutils.errors import AdbError, AdbConnectionError
 
-init(autoreset=True)
-
-# --- CONSTANTS ---
 TARGET_TEXT = "Apply for unlocking"
-BEIJING_TZ = timedelta(hours=8)
+TARGET_TIMEZONE_LIVE = timedelta(hours=8)
+
+NTP_SERVERS =[
+    "time.google.com",
+    "time.cloudflare.com",
+    "time.apple.com",
+    "time.windows.com",
+    "pool.ntp.org"
+]
+
 DEVICE_XML_PATH = "/sdcard/.ui_dump.xml"
 ADB_STAY_ON_KEY = "stay_on_while_plugged_in"
-API_URL_AUTH = "https://sgp-api.buy.mi.com/bbs/api/global/apply/bl-auth"
-API_URL_PREWARM = "https://sgp-api.buy.mi.com/generate_204"
-API_URL_STATUS = "https://sgp-api.buy.mi.com/bbs/api/global/user/bl-switch/state"
 
-NTP_SERVERS = ["time.google.com", "time.cloudflare.com", "pool.ntp.org"]
-PRINT_LOCK = threading.Lock()
 
-def safe_print(text):
-    with PRINT_LOCK:
-        print(text)
+class MiUnlockException(Exception):
+    pass
 
-class MiSession:
-    def __init__(self, threads):
-        self.http = urllib3.PoolManager(
-            maxsize=threads + 10,
-            retries=False,
-            timeout=urllib3.Timeout(connect=3.0, read=5.0)
-        )
 
-    def pre_warm(self, threads_count):
-        def _warm():
-            try: self.http.request('GET', API_URL_PREWARM, timeout=2.5)
-            except: pass
-
-        threads = []
-        for _ in range(threads_count):
-            t = threading.Thread(target=_warm)
-            threads.append(t)
-            t.start()
-        for t in threads: t.join()
-
-    def make_request(self, method, url, headers=None, body=None):
-        try:
-            request_headers = {'Content-Type': 'application/json; charset=utf-8'}
-            if headers: request_headers.update(headers)
-            if method == 'POST':
-                if body is None: body = '{"is_retry":true}'.encode('utf-8')
-                request_headers.update({
-                    'Content-Length': str(len(body)),
-                    'User-Agent': 'okhttp/4.12.0',
-                    'Connection': 'keep-alive'
-                })
-            return self.http.request(method, url, headers=request_headers, body=body, preload_content=False)
-        except: return None
-
-def generate_device_id():
-    return hashlib.sha1(f"{random.random()}-{time.time()}".encode()).hexdigest().upper()
-
-class DeviceManager:
-    def __init__(self, serial=None):
+class MiUnlocker:
+    def __init__(self, serial: str | None = None) -> None:
         try:
             self.client = adbutils.AdbClient(host="127.0.0.1", port=5037)
-        except AdbConnectionError:
-            safe_print(f"{Fore.RED}[-] ADB Server not found. Run 'adb start-server'.")
-            sys.exit(1)
+        except AdbConnectionError as e:
+            raise MiUnlockException(f"Failed to connect to ADB client: {e}")
 
-        devices = self.client.device_list()
-        if not devices:
-            safe_print(f"{Fore.RED}[-] No devices connected.")
-            sys.exit(1)
-
-        self.device = next((d for d in devices if d.serial == serial), None) if serial else devices[0]
-        self.original_timeout = None
-        safe_print(f"{Fore.GREEN}[+] Connected to: {self.device.serial}")
+        self.device: adbutils.AdbDevice | None = None
+        self.original_timeout: str | None = None
+        self._connect_device(serial)
 
     def __enter__(self):
-        self.original_timeout = self.device.shell("settings get system screen_off_timeout").strip()
-        self.device.shell(f"settings put global {ADB_STAY_ON_KEY} 3")
-        self.device.shell("settings put system screen_off_timeout 2147483647")
+        try:
+            self.original_timeout = self.device.shell("settings get system screen_off_timeout").strip()
+
+            if not self.original_timeout or "null" in self.original_timeout:
+                self.original_timeout = "60000"
+
+            self.device.shell(f"settings put global {ADB_STAY_ON_KEY} 3")
+            self.device.shell("settings put system screen_off_timeout 2147483647")
+
+            print(f"[+] Screen set to stay on. Original timeout: {self.original_timeout} ms.")
+        except AdbError as e:
+            raise MiUnlockException(f"ADB error during screen setup: {e}")
+
         return self
 
-    def find_button_coords(self):
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".xml") as tmp:
-            local_xml = tmp.name
+    def _connect_device(self, serial: str | None) -> None:
+        devices = self.client.device_list()
+        if not devices:
+            raise MiUnlockException("No devices found. Ensure ADB server is running and device is connected.")
+
+        if serial:
+            self.device = next((d for d in devices if d.serial == serial), None)
+            if not self.device:
+                raise MiUnlockException(f"Device with serial '{serial}' not found.")
+        else:
+            self.device = devices[0]
+
+        print(f"[+] Connected to device: {self.device.serial}")
+
+    @staticmethod
+    def _find_center_coordinates(xml_file_path: str, target_text: str) -> tuple[int, int] | None:
+        print(f"[*] Parsing XML to find '{target_text}' or button ID...")
+        try:
+            tree = ET.parse(xml_file_path)
+            root = tree.getroot()
+            element = root.find(f".//node[@text='{target_text}']")
+
+            if element is None:
+                element = root.find(".//node[@resource-id='com.mi.global.bbs:id/btnApply']")
+            if element is None:
+                return None
+
+            bounds_str = element.get("bounds")
+            if not bounds_str:
+                return None
+
+            coords = bounds_str.replace("[", "").replace("]", ",").split(",")[:-1]
+            x1, y1, x2, y2 = map(int, coords)
+            center_x, center_y = (x1 + x2) // 2, (y1 + y2) // 2
+
+            print(f"[+] Found element bounds: {bounds_str}. Center: ({center_x}, {center_y})")
+            return center_x, center_y
+        except Exception as e:
+            print(f"[-] Error parsing XML: {e}")
+            return None
+
+    def setup_ui_dump_and_find_coords(self) -> tuple[int, int] | None:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".xml") as tmp_file:
+            local_xml_path = tmp_file.name
+
         try:
             self.device.shell(f"uiautomator dump {DEVICE_XML_PATH}")
-            self.device.sync.pull(DEVICE_XML_PATH, local_xml)
-            tree = ET.parse(local_xml)
-            elem = tree.getroot().find(f".//node[@text='{TARGET_TEXT}']") or \
-                   tree.getroot().find(".//node[@resource-id='com.mi.global.bbs:id/btnApply']")
-            if elem is None: return None
-            bounds = elem.get("bounds").replace("[", "").replace("]", ",").split(",")[:-1]
-            x1, y1, x2, y2 = map(int, bounds)
-            return (x1 + x2) // 2, (y1 + y2) // 2
+            self.device.sync.pull(DEVICE_XML_PATH, local_xml_path)
+            print("[+] Successfully pulled UI dump.")
+            return self._find_center_coordinates(local_xml_path, TARGET_TEXT)
+        except AdbError as e:
+            print(f"[-] ADB error during UI dump: {e}")
+            return None
         finally:
-            if os.path.exists(local_xml): os.remove(local_xml)
+            if os.path.exists(local_xml_path):
+                os.remove(local_xml_path)
 
-    def tap(self, x, y):
-        self.device.shell(f"input tap {x} {y}")
+    def execute_clicks(self, center_x: int, center_y: int, num_clicks: int, click_delay: float) -> None:
+        print(f"[*] Firing ADB clicks at {datetime.now().strftime('%H:%M:%S.%f')[:-3]}...")
+        try:
+            shell_commands =[]
+            for click_num in range(num_clicks):
+                shell_commands.append(f"input tap {center_x} {center_y}")
+                if click_num < num_clicks - 1:
+                    shell_commands.append(f"sleep {click_delay}")
 
-    def __exit__(self, *args):
-        if self.original_timeout:
-            self.device.shell(f"settings put system screen_off_timeout {self.original_timeout}")
-            self.device.shell(f"settings put global {ADB_STAY_ON_KEY} 0")
+            command_batch = "; ".join(shell_commands)
+            self.device.shell(command_batch)
+            print("[SUCCESS] Click sequence execution finished.")
+        except AdbError as e:
+            print(f"[-] ADB error during click execution: {e}")
 
-def check_account(session, token, device_id):
-    headers = {"Cookie": f"new_bbs_serviceToken={token};versionCode=500411;versionName=5.4.11;deviceId={device_id};"}
-    resp = session.make_request('GET', API_URL_STATUS, headers=headers)
-    if resp:
-        data = json.loads(resp.data.decode('utf-8'))
-        if data.get("code") == 100004:
-            safe_print(f"{Fore.RED}[-] Token expired or invalid.")
-            return False
-        safe_print(f"{Fore.GREEN}[+] Account validated.")
-        return True
-    return False
+    def __exit__(self, _exc_type, _exc_value, _traceback):
+        try:
+            if self.original_timeout:
+                self.device.shell(f"settings put system screen_off_timeout {self.original_timeout}")
+                self.device.shell(f"settings put global {ADB_STAY_ON_KEY} 0")
+                print("[+] Restored device screen timeout settings.")
+            self.device.shell(f"rm -f {DEVICE_XML_PATH}")
+        except AdbError as e:
+            print(f"[-] ADB error during cleanup: {e}")
 
-def get_ntp_data():
+
+def get_ntp_sync_data(servers: list[str] = NTP_SERVERS) -> tuple[float, float]:
+    best_ntp_time = None
+    best_perf = None
+    min_delay = float('inf')
+    best_server = None
+
     client = ntplib.NTPClient()
-    for srv in NTP_SERVERS:
+
+    for server in servers:
         try:
             t0 = time.perf_counter()
-            res = client.request(srv, version=3, timeout=1.5)
+            response = client.request(server, version=3, timeout=1.0)
             t1 = time.perf_counter()
-            safe_print(f"{Fore.GREEN}[+] NTP Sync: {srv} (Ping: {(t1-t0)*1000:.1f}ms)")
-            return res.tx_time, t1
-        except: continue
+
+            delay = t1 - t0
+
+            if delay < min_delay:
+                min_delay = delay
+                best_ntp_time = response.tx_time
+                best_perf = t1
+                best_server = server
+
+        except Exception:
+            continue
+
+    if best_ntp_time is not None:
+        print(f"[+] NTP Sync: выбран сервер {best_server} (пинг: {min_delay*1000:.1f} мс)")
+        return best_ntp_time, best_perf
+
+    print("[-] ВНИМАНИЕ: Все NTP серверы недоступны (ошибка сети/таймаут).")
+    print("[-] Переход на использование локальных часов вашего ПК.")
     return time.time(), time.perf_counter()
 
-def calculate_target(offset_delta):
-    ntp_unix, sync_perf = get_ntp_data()
-    now_utc = datetime.fromtimestamp(ntp_unix, tz=timezone.utc)
-    now_bj = now_utc + offset_delta
-    target_bj = (now_bj + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    target_unix = (target_bj - offset_delta).timestamp()
-    return sync_perf + (target_unix - ntp_unix), target_unix - ntp_unix
 
-def api_attack(session, token, device_id, target_perf, threads, feed, stagger):
-    trigger = target_perf - feed
-    while time.perf_counter() < trigger: pass
+def get_target_perf_counter(target_time_str: str, target_tz_offset: timedelta) -> tuple[float, float]:
+    ntp_unix, sync_perf = get_ntp_sync_data()
+    current_time_utc = datetime.fromtimestamp(ntp_unix, tz=timezone.utc)
+    current_time_target_tz = current_time_utc + target_tz_offset
 
-    safe_print(f"{Fore.YELLOW}[API] Flooding {threads} threads...")
-    headers = {"Cookie": f"new_bbs_serviceToken={token};versionCode=500411;versionName=5.4.11;deviceId={device_id};"}
+    target_time_naive = datetime.strptime(target_time_str, "%H:%M:%S.%f").time()
+    target_dt_target_tz = datetime.combine(current_time_target_tz.date(), target_time_naive, tzinfo=current_time_target_tz.tzinfo)
 
-    def _req(tid):
-        resp = session.make_request('POST', API_URL_AUTH, headers=headers)
-        if resp:
-            data = json.loads(resp.data.decode('utf-8'))
-            safe_print(f"{Fore.WHITE}[T{tid}] Response: {data}")
+    if current_time_target_tz >= target_dt_target_tz:
+        tomorrow = current_time_target_tz.date() + timedelta(days=1)
+        target_dt_target_tz = datetime.combine(tomorrow, target_time_naive, tzinfo=current_time_target_tz.tzinfo)
 
-    for i in range(threads):
-        threading.Thread(target=_req, args=(i,)).start()
-        if stagger > 0: time.sleep(stagger / 1000.0)
+    target_dt_utc = target_dt_target_tz - target_tz_offset
+    target_unix = target_dt_utc.timestamp()
 
-def adb_attack(manager, coords, target_perf, offset_ms):
-    trigger = target_perf + (offset_ms / 1000.0)
-    while time.perf_counter() < trigger: pass
-    manager.tap(coords[0], coords[1])
-    safe_print(f"{Fore.CYAN}[ADB] Click executed.")
+    time_to_wait_sec = target_unix - ntp_unix
+    target_perf_counter = sync_perf + time_to_wait_sec
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--offset", type=int, default=-365, help="ADB ms offset.")
-    parser.add_argument("--stagger", type=int, default=5, help="API thread stagger ms.")
-    parser.add_argument("--threads", type=int, default=15, help="API threads count.")
-    parser.add_argument("--feed", type=float, default=0.400, help="API start lead time (sec).")
-    parser.add_argument("--test", action="store_true", help="Run attack in 2 seconds.")
-    parser.add_argument("--serial", type=str, help="Specific device serial.")
+    return target_perf_counter, time_to_wait_sec
+
+
+def wait_and_sync_to_target(target_time_str: str, target_tz_offset: timedelta) -> bool:
+    print("[*] Initial NTP synchronization...")
+    target_perf_counter, time_to_wait_sec = get_target_perf_counter(target_time_str, target_tz_offset)
+
+    if time_to_wait_sec < 0:
+        print("[-] Target time has already passed!")
+        return False
+
+    print(f"[+] Target time set to: {target_time_str} (TZ Offset: {target_tz_offset})")
+    print(f"[+] Initial wait time: {time_to_wait_sec:.3f} seconds.")
+
+    last_print_sec = -1
+    resynced = False
+
+    while True:
+        remaining = target_perf_counter - time.perf_counter()
+
+        if remaining < 30.0 and not resynced and time_to_wait_sec > 60:
+            print("[*] Performing final high-precision NTP resync to fix clock drift...")
+            target_perf_counter, _ = get_target_perf_counter(target_time_str, target_tz_offset)
+            resynced = True
+            continue
+
+        if remaining <= 1.0:
+            break
+
+        current_sec = int(remaining)
+        if current_sec % 5 == 0 and current_sec != last_print_sec:
+            print(f"[*] ~{current_sec} seconds remaining...")
+            last_print_sec = current_sec
+
+        time.sleep(0.1)
+
+    print("[*] Entering precision wait mode (final second spin-lock)...")
+    while time.perf_counter() < target_perf_counter:
+        pass
+
+    return True
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Automate Mi Community unlock request via ADB")
+    parser.add_argument("-s", "--serial", type=str, help="Device serial number (if multiple devices are connected)")
+    parser.add_argument("-c", "--clicks", type=int, default=2, help="Number of clicks (default: 2)")
+    parser.add_argument("-d", "--delay", type=float, default=2.0, help="Delay between clicks in seconds (default: 2.0)")
+    parser.add_argument("--test", action="store_true", help="Run in test mode")
+    parser.add_argument("--test-timezone", type=int, help="Timezone offset in hours for test mode")
+    parser.add_argument("--test-time", type=str, help="Target time for test mode (HH:MM:SS or HH:MM:SS.fff)")
+    parser.add_argument("--offset-ms", type=int, default=-365, help="Offset in milliseconds to compensate ADB latency (default: -365)")
     args = parser.parse_args()
 
-    print(f"{Fore.MAGENTA}{Style.BRIGHT}--- HyperOS Universal Sniper ---")
-
-    # --- MODE SELECTION ---
-    print(f"\n{Fore.WHITE}Select Execution Mode:")
-    print(f"{Fore.CYAN}[1] Hybrid (API + ADB) - Recommended")
-    print(f"{Fore.CYAN}[2] API Only")
-    print(f"{Fore.CYAN}[3] ADB Only")
-    mode = input(f"{Fore.YELLOW}Choice [1-3]: ").strip() or "1"
-
-    token = ""
-    if mode in ["1", "2"]:
-        webbrowser.open("https://account.xiaomi.com/fe/service/login/password?_locale=en_IN&sid=18n_bbs_global")
-        token = input(f"{Fore.CYAN}Enter new_bbs_serviceToken: ").strip()
-
-    session = MiSession(args.threads)
-    device_id = generate_device_id()
-
-    # Проверка аккаунта только если выбран API
-    if mode in ["1", "2"] and not args.test:
-        if not check_account(session, token, device_id):
-            sys.exit(1)
-
-    # Инициализация ADB если нужно
-    manager = None
-    coords = None
-    if mode in ["1", "3"]:
-        manager = DeviceManager(args.serial)
-        manager.__enter__()
-        coords = manager.find_button_coords()
-        if not coords:
-            safe_print(f"{Fore.RED}[-] Button not found on screen.")
-            manager.__exit__()
-            return
+    if args.test:
+        if args.test_timezone is None or args.test_time is None:
+            parser.error("--test-timezone and --test-time are required when using --test")
+        target_time_str = args.test_time if "." in args.test_time else f"{args.test_time}.000"
+        target_tz_offset = timedelta(hours=args.test_timezone)
+        print(f"[*] Test Mode: GMT{args.test_timezone:+d}")
+    else:
+        base_target = datetime.strptime("23:59:59.999", "%H:%M:%S.%f") + timedelta(milliseconds=args.offset_ms - 999)
+        target_time_str = base_target.strftime("%H:%M:%S.%f")[:-3]
+        target_tz_offset = TARGET_TIMEZONE_LIVE
+        print("[*] Live Mode: Beijing Time (GMT+8)")
+        print(f"[*] ADB Latency Compensation: {args.offset_ms}ms")
 
     try:
-        if args.test:
-            target_perf = time.perf_counter() + 2.0
-            wait_sec = 2.0
-        else:
-            target_perf, wait_sec = calculate_target(BEIJING_TZ)
-            safe_print(f"{Fore.GREEN}[*] Waiting {wait_sec:.2f}s for 00:00:00 Beijing.")
+        with MiUnlocker(serial=args.serial) as unlocker:
+            click_coords = unlocker.setup_ui_dump_and_find_coords()
+            if not click_coords:
+                print("[-] Could not determine click coordinates. Ensure the app is open and button is visible.")
+                return
 
-        warmed = False
-        while (target_perf - time.perf_counter()) > 0:
-            rem = target_perf - time.perf_counter()
-            # Преварм только если выбран API
-            if mode in ["1", "2"] and rem < 3.5 and not warmed:
-                safe_print(f"{Fore.BLUE}[*] Pre-warming SSL sockets...")
-                session.pre_warm(args.threads)
-                warmed = True
+            center_x, center_y = click_coords
 
-            if rem > 1: time.sleep(0.1)
-            else: break
+            if wait_and_sync_to_target(target_time_str, target_tz_offset):
+                unlocker.execute_clicks(center_x, center_y, args.clicks, args.delay)
+                time.sleep(5)
 
-        safe_print(f"{Fore.RED}[!] ATTACK ENGAGED (Mode: {mode})")
-
-        threads = []
-        if mode in ["1", "2"]:
-            api_t = threading.Thread(target=api_attack, args=(session, token, device_id, target_perf, args.threads, args.feed, args.stagger))
-            threads.append(api_t)
-
-        if mode in ["1", "3"]:
-            adb_t = threading.Thread(target=adb_attack, args=(manager, coords, target_perf, args.offset))
-            threads.append(adb_t)
-
-        for t in threads: t.start()
-        for t in threads: t.join()
-
-    finally:
-        if manager:
-            manager.__exit__()
-
-    safe_print(f"{Fore.GREEN}[+] Finished.")
+    except MiUnlockException as e:
+        print(f"[-] Initialization Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\n[-] Cancelled by user.")
+        sys.exit(0)
 
 if __name__ == "__main__":
-    try: main()
-    except KeyboardInterrupt: os._exit(0)
+    main()
